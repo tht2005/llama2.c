@@ -1,6 +1,8 @@
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
 CC = gcc
+HIPCC = hipcc
+HIPARCH ?= gfx90a
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
@@ -27,6 +29,10 @@ rundebug: run.c
 runfast: run.c
 	$(CC) -Ofast -o run run.c -lm
 	$(CC) -Ofast -o runq runq.c -lm
+
+.PHONY: runhip
+runhip: run_hip.c
+	$(HIPCC) -O3 -x hip --offload-arch=$(HIPARCH) -o runhip run_hip.c
 
 # additionally compiles with OpenMP, allowing multithreaded runs
 # make sure to also enable multiple threads when running, e.g.:
