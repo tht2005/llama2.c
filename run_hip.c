@@ -35,10 +35,10 @@ typedef struct {
 } TransformerWeights;
 
 typedef struct {
-    float *x, *xb, *xb2;   // (dim,)
-    float *hb, *hb2;       // (hidden_dim,)
-    float *q;              // (dim,)
-    float *att;            // (n_heads, seq_len)
+    float *x, *xb, *xb2;   // (seq_len, dim)
+    float *hb, *hb2;       // (seq_len, hidden_dim)
+    float *q;              // (seq_len, dim)
+    float *att;            // (n_heads, seq_len * seq_len)
     float *logits_dev;     // (vocab_size,) on device
     float *logits;         // (vocab_size,) on host
     float *key_cache, *value_cache;   // (layer, seq_len, kv_dim)
@@ -72,13 +72,13 @@ static void map_weights_device(TransformerWeights *w, Config *p, float *ptr, int
 
 static void malloc_run_state(RunState *s, Config *p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    HIP_CHECK(hipMalloc(&s->x,   p->dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->xb,  p->dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->xb2, p->dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->hb,  p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->hb2, p->hidden_dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->q,   p->dim * sizeof(float)));
-    HIP_CHECK(hipMalloc(&s->att, (size_t)p->n_heads * p->seq_len * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->x,   p->seq_len * p->dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->xb,  p->seq_len * p->dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->xb2, p->seq_len * p->dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->hb,  p->seq_len * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->hb2, p->seq_len * p->hidden_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->q,   p->seq_len * p->dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&s->att, (size_t)p->n_heads * p->seq_len * p->seq_len * sizeof(float)));
     HIP_CHECK(hipMalloc(&s->logits_dev, p->vocab_size * sizeof(float)));
     HIP_CHECK(hipMalloc(&s->key_cache,   (size_t)p->n_layers * p->seq_len * kv_dim * sizeof(float)));
     HIP_CHECK(hipMalloc(&s->value_cache, (size_t)p->n_layers * p->seq_len * kv_dim * sizeof(float)));
@@ -142,6 +142,20 @@ __global__ void matmul_kernel(float *xout, const float *x, const float *w, int n
     xout[i] = sum;
 }
 
+// W(d, n) @ x(B, n) -> xout(B, d)
+__global__ void matmul_batched_kernel(float *xout, const float *x, const float *w, int n, int d, int B) {
+    const int b = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d || b >= B) return;
+
+    const float *x_row = x + b*n;
+    float sum = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        sum += w[i*n + j] * x_row[j];
+    }
+    xout[b*d + i] = sum;
+}
+
 // rmsnorm: normalize x (RMS over `size`) and scale by `weight`. Launched <<<1,BLK>>>.
 // TODO: 1) each thread sums x[j]*x[j] over a strided range; block-reduce in __shared__
 //          memory (halving loop);  2) scale = 1/sqrtf(sumsq/size + 1e-5f);
@@ -149,12 +163,10 @@ __global__ void matmul_kernel(float *xout, const float *x, const float *w, int n
 // DUMMY: copies x through unchanged.
 __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight, int size) {
     __shared__ float sdata[BLK];
-    const int seq_l = blockIdx.x * size;
-    const int seq_r = seq_l + size;
     const int tid = threadIdx.x;
     
     float strided_sum = 0;
-    for (int j = seq_l + tid; j < seq_r; j += blockDim.x) {
+    for (int j = tid; j < size; j += blockDim.x) {
         strided_sum += x[j] * x[j];
     }
     sdata[tid] = strided_sum;
@@ -174,8 +186,43 @@ __global__ void rmsnorm_kernel(float *o, const float *x, const float *weight, in
     }
     __syncthreads();
 
-    for (int j = seq_l + tid; j < seq_r; j += blockDim.x) {
-        o[j] = weight[j - seq_l] * (scale * x[j]);
+    for (int j = tid; j < size; j += blockDim.x) {
+        o[j] = weight[j] * (scale * x[j]);
+    }
+}
+
+__global__ void rmsnorm_batched_kernel(float *o, const float *x, const float *weight, int size, int B) {
+    const int b = blockIdx.x;
+    if (b >= B) return;
+
+    __shared__ float sdata[BLK];
+    const int tid = threadIdx.x;
+
+    const float *x_row = x + b*size;
+    float *o_row = o + b*size;
+
+    float strided_sum = 0.0f;
+    for (int j = tid; j < size; j += blockDim.x) {
+        strided_sum += x_row[j] * x_row[j];
+    }
+    sdata[tid] = strided_sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float scale;
+    if (tid == 0) {
+        scale = 1.0f / sqrtf(sdata[0] / size + 1e-5f);
+    }
+    __syncthreads();
+
+    for (int j = tid; j < size; j += blockDim.x) {
+        o_row[j] = weight[j] * (scale * x_row[j]);
     }
 }
 
@@ -206,6 +253,35 @@ __global__ void rope_kernel(float *q, float *k, int pos, int dim, int kv_dim, in
         float k1 = k[idx + 1];
         k[idx] = k0 * fcr - k1 * fci;
         k[idx + 1] = k0 * fci + k1 * fcr;
+    }
+}
+
+__global__ void rope_batched_kernel(float *q, float *k, int pos, int dim, int kv_dim, int head_size, int B) {
+    const int b = blockIdx.y;
+    const int g_tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int idx = g_tid << 1;
+    if (b >= B || idx >= dim) return;
+
+    const int head_dim = idx % head_size;
+    
+    const int cur_pos = pos + b;
+
+    const float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+    const float fcr = cosf(cur_pos * freq);
+    const float fci = sinf(cur_pos * freq);
+
+    float *q_row = q + b * dim;
+    float q0 = q_row[idx];
+    float q1 = q_row[idx + 1];
+    q_row[idx] = q0 * fcr - q1 * fci;
+    q_row[idx + 1] = q0 * fci + q1 * fcr;
+
+    if (idx < kv_dim) {
+        float *k_row = k + b * kv_dim;
+        float k0 = k_row[idx];
+        float k1 = k_row[idx + 1];
+        k_row[idx] = k0 * fcr - k1 * fci;
+        k_row[idx + 1] = k0 * fci + k1 * fcr;
     }
 }
 
@@ -298,11 +374,101 @@ __global__ void attention_kernel(float *att_all, const float *q_all,
     }
 }
 
+__global__ void attention_prefill_kernel(float *att_all, const float *q_all,
+                                         const float *layer_k, const float *layer_v,
+                                         float *xb_all, int num_rows, int head_size,
+                                         int kv_dim, int kv_mul, int seq_len) {
+    const int h = blockIdx.x; 
+    const int tid = threadIdx.x;
+
+    const float *q_head = q_all + h * head_size;
+    float *xb_head = xb_all + h * head_size;
+    float *att_head = att_all + h * seq_len * seq_len;
+
+    int kv_head = h / kv_mul;
+    const float *kbase = layer_k + kv_head * head_size;
+    const float *vbase = layer_v + kv_head * head_size;
+    float scale = 1.0f / sqrtf((float)head_size);
+
+    for (int r = 0; r < num_rows; ++r) {
+        const float *q = q_head + r * (gridDim.x * head_size);
+        float *att = att_head + r * seq_len;
+
+        for (int t = tid; t < num_rows; t += blockDim.x) {
+            if (t <= r) {
+                const float *k_t = kbase + t * kv_dim;
+                float score = 0.0f;
+                for (int i = 0; i < head_size; ++i) score += q[i] * k_t[i];
+                att[t] = score * scale;
+            } else {
+                att[t] = -1e20f; 
+            }
+        }
+        __syncthreads();
+
+        __shared__ float sdata[BLK];
+        float local_max = -1e20f;
+        for (int t = tid; t <= r; t += blockDim.x) {
+            if (att[t] > local_max) local_max = att[t];
+        }
+        sdata[tid] = local_max;
+        __syncthreads();
+
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride && sdata[tid + stride] > sdata[tid]) sdata[tid] = sdata[tid + stride];
+            __syncthreads();
+        }
+        __shared__ float max_val;
+        if (tid == 0) max_val = sdata[0];
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (int t = tid; t < num_rows; t += blockDim.x) {
+            if (t <= r) {
+                float exp_score = expf(att[t] - max_val);
+                att[t] = exp_score;
+                local_sum += exp_score;
+            } else {
+                att[t] = 0.0f;
+            }
+        }
+        sdata[tid] = local_sum;
+        __syncthreads();
+
+        for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+            if (tid < stride) sdata[tid] += sdata[tid + stride];
+            __syncthreads();
+        }
+        __shared__ float sum_total;
+        if (tid == 0) sum_total = sdata[0];
+        __syncthreads();
+
+        float *xb = xb_head + r * (gridDim.x * head_size);
+        for (int i = tid; i < head_size; i += blockDim.x) {
+            float val_acc = 0.0f;
+            for (int t = 0; t <= r; ++t) {
+                const float* v_t = vbase + t * kv_dim;
+                val_acc += att[t] * v_t[i];
+            }
+            xb[i] = val_acc / sum_total;
+        }
+        __syncthreads();
+    }
+}
+
 // residual: x[i] += y[i].   DUMMY: leaves x as-is (drops the residual add).
 __global__ void residual_kernel(float *x, const float *y, int size) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= size) return;
     x[i] += y[i];
+}
+
+__global__ void residual_batched_kernel(float *x, const float *y, int size, int num_rows) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= size || row >= num_rows) return;
+    int idx = row * size + col;
+    x[idx] += y[idx];
 }
 
 // swiglu: hb[i] = silu(hb[i]) * hb2[i], with silu(v)=v/(1+expf(-v)).
@@ -314,7 +480,118 @@ __global__ void swiglu_kernel(float *hb, const float *hb2, int size) {
     hb[i] = silu * hb2[i];
 }
 
+__global__ void swiglu_batched_kernel(float *hb, const float *hb2, int size, int num_rows) {
+    int row = blockIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= size || row >= num_rows) return;
+    int idx = row * size + col;
+    float val = hb[idx];
+    float silu = val / (1.0f + expf(-val));
+    hb[idx] = silu * hb2[idx];
+}
+
 static inline int grid(int n) { return (n + BLK - 1) / BLK; }  // blocks to cover n
+
+static void forward_prefill(Transformer *transformer, const int *tokens, int prompt_len) {
+    Config *p = &transformer->config;
+    TransformerWeights *w = &transformer->weights;
+    RunState *s = &transformer->state;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    for (int i = 0; i < prompt_len; i++) {
+        HIP_CHECK(hipMemcpy(s->x + (size_t)i * dim, w->token_embedding_table + (size_t)tokens[i] * dim,
+                            dim * sizeof(float), hipMemcpyDeviceToDevice));
+    }
+
+    dim3 block_dim(BLK);
+    dim3 grid_dim_dim(grid(dim), prompt_len);
+    dim3 grid_dim_kv(grid(kv_dim), prompt_len);
+    dim3 grid_dim_hidden(grid(hidden_dim), prompt_len);
+
+    for (int l = 0; l < p->n_layers; l++) {
+        rmsnorm_batched_kernel<<<prompt_len, BLK>>>(s->xb, s->x, w->rms_att_weight + l * dim, dim, prompt_len);
+
+        size_t loff = (size_t)l * p->seq_len * kv_dim;
+        float *k_dest = s->key_cache + loff;
+        float *v_dest = s->value_cache + loff;
+
+        matmul_batched_kernel<<<grid_dim_dim, block_dim>>>(s->q, s->xb, w->wq + l * dim * dim, dim, dim, prompt_len);
+        matmul_batched_kernel<<<grid_dim_kv, block_dim>>>(k_dest, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim, prompt_len);
+        matmul_batched_kernel<<<grid_dim_kv, block_dim>>>(v_dest, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim, prompt_len);
+
+        rope_batched_kernel<<<grid_dim_dim, block_dim>>>(s->q, k_dest, 0, dim, kv_dim, head_size, prompt_len);
+
+        attention_prefill_kernel<<<p->n_heads, BLK>>>(s->att, s->q, k_dest, v_dest, s->xb, prompt_len, head_size, kv_dim, kv_mul, p->seq_len);
+
+        matmul_batched_kernel<<<grid_dim_dim, block_dim>>>(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim, prompt_len);
+        residual_batched_kernel<<<grid_dim_dim, block_dim>>>(s->x, s->xb2, dim, prompt_len);
+
+        rmsnorm_batched_kernel<<<prompt_len, BLK>>>(s->xb, s->x, w->rms_ffn_weight + l * dim, dim, prompt_len);
+
+        matmul_batched_kernel<<<grid_dim_hidden, block_dim>>>(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim, prompt_len);
+        matmul_batched_kernel<<<grid_dim_hidden, block_dim>>>(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim, prompt_len);
+        swiglu_batched_kernel<<<grid_dim_hidden, block_dim>>>(s->hb, s->hb2, hidden_dim, prompt_len);
+        matmul_batched_kernel<<<grid_dim_dim, block_dim>>>(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim, prompt_len);
+
+        residual_batched_kernel<<<grid_dim_dim, block_dim>>>(s->x, s->xb, dim, prompt_len);
+    }
+
+    float *last_x_row = s->x + (size_t)(prompt_len - 1) * dim;
+    rmsnorm_batched_kernel<<<1, BLK>>>(s->xb, last_x_row, w->rms_final_weight, dim, 1);
+    matmul_batched_kernel<<<grid(p->vocab_size), BLK>>>(s->logits_dev, s->xb, w->wcls, dim, p->vocab_size, 1);
+    HIP_CHECK(hipMemcpy(s->logits, s->logits_dev, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+}
+
+static float *forward_decode(Transformer *transformer, int token, int pos) {
+    Config *p = &transformer->config;
+    TransformerWeights *w = &transformer->weights;
+    RunState *s = &transformer->state;
+    int dim = p->dim;
+    int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    int hidden_dim = p->hidden_dim;
+    int head_size = dim / p->n_heads;
+
+    HIP_CHECK(hipMemcpy(s->x, w->token_embedding_table + (size_t)token * dim, dim * sizeof(float), hipMemcpyDeviceToDevice));
+
+    for (int l = 0; l < p->n_layers; l++) {
+        rmsnorm_batched_kernel<<<1, BLK>>>(s->xb, s->x, w->rms_att_weight + l * dim, dim, 1);
+
+        size_t loff = (size_t)l * p->seq_len * kv_dim;
+        float *k = s->key_cache + loff + (size_t)pos * kv_dim;
+        float *v = s->value_cache + loff + (size_t)pos * kv_dim;
+
+        matmul_batched_kernel<<<grid(dim), BLK>>>(s->q, s->xb, w->wq + l * dim * dim, dim, dim, 1);
+        matmul_batched_kernel<<<grid(kv_dim), BLK>>>(k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim, 1);
+        matmul_batched_kernel<<<grid(kv_dim), BLK>>>(v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim, 1);
+
+        rope_batched_kernel<<<grid(dim / 2), BLK>>>(s->q, k, pos, dim, kv_dim, head_size, 1);
+
+        attention_kernel<<<p->n_heads, BLK>>>(s->att, s->q, s->key_cache + loff, s->value_cache + loff, s->xb, pos, head_size, kv_dim, kv_mul, p->seq_len);
+
+        matmul_batched_kernel<<<grid(dim), BLK>>>(s->xb2, s->xb, w->wo + l * dim * dim, dim, dim, 1);
+        residual_batched_kernel<<<grid(dim), BLK>>>(s->x, s->xb2, dim, 1);
+
+        rmsnorm_batched_kernel<<<1, BLK>>>(s->xb, s->x, w->rms_ffn_weight + l * dim, dim, 1);
+
+        matmul_batched_kernel<<<grid(hidden_dim), BLK>>>(s->hb, s->xb, w->w1 + l * dim * hidden_dim, dim, hidden_dim, 1);
+        matmul_batched_kernel<<<grid(hidden_dim), BLK>>>(s->hb2, s->xb, w->w3 + l * dim * hidden_dim, dim, hidden_dim, 1);
+        swiglu_batched_kernel<<<grid(hidden_dim), BLK>>>(s->hb, s->hb2, hidden_dim, 1);
+        matmul_batched_kernel<<<grid(dim), BLK>>>(s->xb, s->hb, w->w2 + l * dim * hidden_dim, hidden_dim, dim, 1);
+
+        residual_batched_kernel<<<grid(dim), BLK>>>(s->x, s->xb, dim, 1);
+    }
+
+    rmsnorm_batched_kernel<<<1, BLK>>>(s->x, s->x, w->rms_final_weight, dim, 1);
+    matmul_batched_kernel<<<grid(p->vocab_size), BLK>>>(s->logits_dev, s->x, w->wcls, dim, p->vocab_size, 1);
+
+    HIP_CHECK(hipMemcpy(s->logits, s->logits_dev, p->vocab_size * sizeof(float), hipMemcpyDeviceToHost));
+    return s->logits;
+}
 
 static float *forward(Transformer *transformer, int token, int pos) {
     Config *p = &transformer->config;
@@ -526,6 +803,44 @@ static long time_in_ms() {
     return t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
+static void generate_with_prefill_decode_split(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+                     char *prompt, int steps) {
+    char empty[] = "";
+    if (prompt == NULL) prompt = empty;
+    int num_prompt_tokens = 0;
+    int *prompt_tokens = (int *)malloc((strlen(prompt) + 3) * sizeof(int));
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) { fprintf(stderr, "expected >=1 prompt token\n"); exit(EXIT_FAILURE); }
+    if (steps > transformer->config.seq_len) steps = transformer->config.seq_len;
+
+    long start = time_in_ms();
+
+    forward_prefill(transformer, prompt_tokens, num_prompt_tokens);
+    int token = prompt_tokens[num_prompt_tokens - 1];
+    int next = sample(sampler, transformer->state.logits);
+    int pos = num_prompt_tokens;
+
+    char *piece = decode(tokenizer, token, next);
+    safe_printf(piece); fflush(stdout);
+    token = next;    
+
+    while (pos < steps) {
+        float *logits = forward_decode(transformer, token, pos);
+        next = sample(sampler, logits);
+        pos++;
+        if (next == 1) break;
+        char *piece = decode(tokenizer, token, next);
+        safe_printf(piece); fflush(stdout);
+        token = next;
+    }
+    printf("\n");
+    if (pos > num_prompt_tokens) {
+        long end = time_in_ms();
+        fprintf(stderr, "[prefill] achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+    }
+    free(prompt_tokens);    
+}
+
 static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
                      char *prompt, int steps) {
     char empty[] = "";
@@ -551,7 +866,7 @@ static void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sa
     printf("\n");
     if (pos > 1) {
         long end = time_in_ms();
-        fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+        fprintf(stderr, "[original] achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
     }
     free(prompt_tokens);
 }
@@ -596,6 +911,7 @@ int main(int argc, char *argv[]) {
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
     generate(&transformer, &tokenizer, &sampler, prompt, steps);
+    generate_with_prefill_decode_split(&transformer, &tokenizer, &sampler, prompt, steps);
 
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
